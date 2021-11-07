@@ -79,29 +79,58 @@
 	01 Jul 2021 : Check if macro is running to avoid auto-indentation and lists side effects.
 	06 Jul 2021 : Optimize LoopCr(), LoopLeftDel(), LoopRightDel() a bit.
 	25 Sep 2021 : Add editln variable. Use SysLineEdit() when editing.
+	   Nov 2021 : (Ladislau Szilagyi) Adapted for RC2014's SC108 128KB RAM memory module
 
 	Notes:
 
 	See FIX-ME notes.
 */
-
 /* Libraries
    ---------
 */
 #define CC_FGETS
 #define CC_FPUTS
 
-#include <mescc.h>
 #include <string.h>
 #include <ctype.h>
-#include <fileio.h>
-#include <sprintf.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <cpm.h>
+#include <dynm128.h>
 
 /* TE definitions
    --------------
 */
-#include "te.h"
-#include "te_keys.h"
+#include <te.h>
+#include <tekeys.h>
+
+extern char cf_name[];
+extern unsigned char cf_rows;
+extern unsigned char cf_cols;
+extern int cf_mx_lines;
+extern unsigned char cf_tab_cols;
+extern unsigned char cf_num;
+extern unsigned char cf_clang;
+extern unsigned char cf_indent;
+extern unsigned char cf_list;
+extern char cf_list_chr[];
+extern char cf_cr_name[];
+extern char cf_esc_name[];
+extern unsigned char cf_keys[];
+extern unsigned char cf_keys_ex[];
+extern unsigned char cf_rul_chr;
+extern unsigned char cf_rul_tab;
+extern unsigned char cf_vert_chr;
+extern unsigned char cf_horz_chr;
+extern unsigned char cf_lnum_chr;
+extern unsigned int cf_start;
+extern unsigned char cf_version;
+extern int cf_bytes;
+
+int   tmp;
+char* ptmp;
+char  tmpbuf[256];
+char  bank;
 
 /* Operating system
    ----------------
@@ -111,7 +140,8 @@ int cpm_ver;  /* CP/M version */
 /* Array of text lines
    -------------------
 */
-WORD *lp_arr; /* Text lines pointers array */
+char** lp_arr;			/* Pointer of Text lines pointers array */
+char* lp_arr_i_bank; 		/* Pointer of Text lines dynamic memory banks array */
 int   lp_now; /* How many lines are in the array */
 int   lp_cur; /* Current line */
 int   lp_chg; /* 0 if no changes are made */
@@ -119,7 +149,7 @@ int   lp_chg; /* 0 if no changes are made */
 /* Current line
    ------------
 */
-char *ln_dat; /* Data buffer */
+char ln_dat[CRT_DEF_COLS+1]; /* Data buffer */
 int   ln_max; /* Max. # of characters */
 
 /* Clipboard & block selection
@@ -131,7 +161,9 @@ int blk_start;   /* Start line # */
 int blk_end;     /* End line # */
 int blk_count;   /* # of lines */
 
-WORD *clp_arr;   /* Multi-line */
+char* clp_arr[CLP_LINES_MAX];		/* Multi-line clipboard lines pointers array */
+char clp_arr_i_bank[CLP_LINES_MAX];	/* Multi-line clipboard lines memory banks array */
+
 int   clp_count; /* # of lines */
 
 #else
@@ -155,7 +187,7 @@ int box_shc;  /* Horizontal position of cursor in the box (0..cf_cols - 1) */
 /* Keyboard forced entry
    ---------------------
 */
-int *fe_dat;   /* Data buffer */
+int fe_dat[FORCED_MAX];   /* Data buffer */
 int fe_now;    /* How many characters are now in the buffer */
 int fe_set;    /* Set position */
 int fe_get;    /* Get position */
@@ -208,38 +240,34 @@ int help_items[] = {
 	-1
 };
 
-/* TE modules
-   ----------
-*/
-#include "te_conf.c"
-#include "te_ui.c"
-#include "te_file.c"
-#include "te_keys.c"
-#include "te_edit.c"
-#include "te_lines.c"
-#include "te_misc.c"
-#include "te_error.c"
-
-#if OPT_MACRO
-
-#include "te_macro.c"
-
-#endif
+void* AllocMem(short bytes, char* bank);
+void ErrLineMem(void);
+int ReadFile(char* p);
+int BfEdit(void);
+int Menu(void);
+int GetFirstLine(void);
+int GetLastLine(void);
+int SplitLine(int,int);
+int AppendLine(int,char*);
+int InsertLine(int,char*);
+int MacroRunning(void);
+int LoopCopyEx(void);
+int JoinLines(int);
+int DeleteLine(int);
+int SysLineStr(char* what, char* buf, int maxlen);
+char* FreeClipboard(void);
 
 /* Program entry
    -------------
 */
-main(argc, argv)
-int argc, argv[];
+main(int argc, char** argv)
 {
 	int i;
 	
+	InitDynM();	/* init 64KB Upper RAM dynamic memory */
+
 	/* Get CP/M version */
-	cpm_ver = bdos_a(0x0C, 0x0000);
-	
-	/* Adjust auto rows and columns configuration values */
-	cf_rows = GetScrConf(0, cf_rows, CRT_DEF_ROWS);
-	cf_cols = GetScrConf(1, cf_cols, CRT_DEF_COLS);
+	cpm_ver = bdos(0x0C, 0x0000);
 	
 	/* Setup CRT */
 	CrtSetup();
@@ -257,33 +285,33 @@ int argc, argv[];
 	/* Print layout */
 	Layout();
 
-	/* Allocate buffers -- FIXME -- use AllocMem() ?? */
-	ln_dat = malloc(ln_max + 2);
+	/* ln_dat = malloc(ln_max + 2); */
 
-	fe_dat = malloc(FORCED_MAX * SIZEOF_INT);
+	/* fe_dat = malloc(FORCED_MAX * 2); */
 
-	lp_arr = malloc(cf_mx_lines * SIZEOF_PTR);
+	/* alloc text lines pointers array */
+	/* Must belong to the lower 64KB RAM */
+	lp_arr = malloc(cf_mx_lines * 2);
+
+	/* alloc text lines dynamic memory banks array */
+	/* Must belong to the lower 64KB RAM */
+	lp_arr_i_bank = malloc(cf_mx_lines);
 
 	i = 1;
 
-	if(ln_dat && fe_dat && lp_arr) {
-
+	if(lp_arr && lp_arr_i_bank) 
+	{
 #if OPT_BLOCK
 #else
-
-		if((clp_line = malloc(ln_max + 1))) {
+		if((clp_line = malloc(ln_max + 1))) 
+		{ 
 
 #endif
-
 			i = 0;
-
 #if OPT_BLOCK
 #else
-
 		}
-
 #endif
-
 	}
 
 	if(i)
@@ -293,32 +321,27 @@ int argc, argv[];
 
 	/* Setup clipboard */
 #if OPT_BLOCK
-
-	clp_arr = NULL;
 	clp_count = 0;
-
 #else
-
 	*clp_line = '\0';
-
 #endif
 
-	/* Setup lines */
-	for(i = 0; i < cf_mx_lines; ++i) {
+	/* init line pointers */
+	for(i = 0; i < cf_mx_lines; ++i)
 		lp_arr[i] = NULL;
-	}
+
+	/* init clipboard line pointers */
+	for(i = 0; i < CLP_LINES_MAX; ++i)
+		clp_arr[i] = NULL;
 
 	/* Check command line */
 	if(argc == 1)
-	{
 		NewFile();
-	}
 	else if(argc == 2)
 	{
 		if(strlen(argv[1]) > FILENAME_MAX - 1)
 		{
 			ErrLine("Filename too long");
-
 			NewFile();
 		}
 		else if(ReadFile(argv[1]))
@@ -329,7 +352,6 @@ int argc, argv[];
 	else
 	{
 		ErrLine("Bad command line. Use: te [filename]");
-
 		NewFile();
 	}
 
@@ -342,28 +364,6 @@ int argc, argv[];
 
 	/* Exit */
 	return 0;
-}
-
-/* Get # of rows / columns on auto configuration value
-   ---------------------------------------------------
-*/
-GetScrConf(n, val, def_val)
-int n, val, def_val;
-{
-	unsigned char scb_pb[2];
-	
-	if(val == 0) {
-		val = def_val;
-		
-		if(cpm_ver >= 0x30) {
-			scb_pb[0] = (n == 0 ? 0x1C : 0x1A);
-			scb_pb[1] = 0;
-
-			val = bdos_a(0x31, scb_pb) + 1;
-		}
-	}
-	
-	return val;
 }
 
 /* Main loop
@@ -392,7 +392,6 @@ Loop()
 		if(sysln)
 		{
 			SysLineEdit();
-
 			sysln = 0;
 		}
 
@@ -400,13 +399,9 @@ Loop()
 		CrtLocate(PS_ROW, PS_CLP);
 
 #if OPT_BLOCK
-
 	putstr(clp_count ? "CLP" : "---");
-
 #else
-
 	putstr(*clp_line ? "CLP" : "---");
-
 #endif
 
 		/* Print current line number, etc. */
@@ -465,7 +460,6 @@ Loop()
 			case K_CLRCLP : /* Clear the clipboard ------------ */
 				LoopClrClp();
 				break;
-
 #if OPT_BLOCK
 			case K_BLK_START : /* Set block start ------------- */
 				LoopBlkStart();
@@ -477,7 +471,6 @@ Loop()
 				LoopBlkUnset();
 				break;
 #endif
-
 #if OPT_FIND
 			case K_FIND :  /* Find string --------------------- */
 				LoopFindFirst();
@@ -486,25 +479,21 @@ Loop()
 				LoopFindNext();
 				break;
 #endif
-
 #if OPT_GOTO
 			case K_GOTO :  /* Go to line # -------------------- */
 				LoopGoLine();
 				break;
 #endif
-
-
 #if OPT_MACRO
 			case K_MACRO : /* Execute macro from file --------- */
 				LoopMacro();
 				break;
 #endif
-
 			case K_ESC :   /* Show the menu ------------------- */
-				if(Menu()) {
+				if(Menu()) 
 					run = 0;
-				}
-				else {
+				else 
+				{
 					ShowFilename(); /* Refresh filename */
 					RefreshAll();   /* Refresh editor box */
 				}
@@ -518,7 +507,7 @@ Loop()
 */
 LoopUp()
 {
-	--lp_cur; // FIXME -- check if we are on the 1st line?
+	--lp_cur; /* FIXME -- check if we are on the 1st line? */
 
 	if(box_shr)
 		--box_shr;
@@ -531,7 +520,7 @@ LoopUp()
 */
 LoopDown()
 {
-	++lp_cur; // FIXME -- check if we are on the last line?
+	++lp_cur; /* FIXME -- check if we are on the last line? */
 
 	if(box_shr < box_rows - 1)
 		++box_shr;
@@ -550,9 +539,8 @@ LoopTop()
 
 	lp_cur = box_shr = box_shc = 0;
 
-	if(first > 0) {
+	if(first > 0)
 		RefreshAll();
-	}
 }
 
 /* Go to document bottom
@@ -568,13 +556,13 @@ LoopBottom()
 	lp_cur = lp_now - 1;
 	box_shc = 999;
 
-	if(last < lp_now - 1) {
+	if(last < lp_now - 1) 
+	{
 		box_shr = box_rows - 1;
 		RefreshAll();
 	}
-	else {
+	else 
 		box_shr = last - first;
-	}
 }
 
 /* Page up
@@ -629,103 +617,95 @@ LoopCr()
 	int ok;
 	int i, k;
 	
-	if(box_shc) {
-		if(ln_dat[box_shc]) {
+	if(box_shc) 
+	{
+		if(ln_dat[box_shc]) 
+		{
 			/* Cursor is in the middle of the line */
-			if((ok = SplitLine(lp_cur, box_shc))) {
+			if((ok = SplitLine(lp_cur, box_shc))) 
 				CrtClearEol();
-			}
 		}
-		else {
-			/* Cursor is at the end of the line */
-			ok = AppendLine(lp_cur, NULL);
-		}
+		else 
+			ok = AppendLine(lp_cur, NULL); /* Cursor is at the end of the line */
 	}
-	else {
+	else 
+	{
 		/* Cursor is in first column */
-		if((ok = InsertLine(lp_cur, NULL))) {
-			if(ln_dat[0]) {
-				/* Line is not empty */
-				CrtClearEol();
-			}
-			/* else { */
-				/* Line is empty */
-			/* } */
+		if((ok = InsertLine(lp_cur, NULL))) 
+		{
+			if(ln_dat[0]) 
+				CrtClearEol();	/* Line is not empty */
 		}
 	}
 
-	if(ok) {
-
+	if(ok) 
+	{
 		++lp_cur;
-		
 		k = 0;
-		
 #if OPT_MACRO
 		if(!MacroRunning())
 		{
 #endif		
-
-			if(box_shc) {
-				
+			if(box_shc) 
+			{
 				i = 0;
 				
-				if(cf_indent) {
-					while(ln_dat[i] == ' ') {
+				if(cf_indent) 
+				{
+					while(ln_dat[i] == ' ') 
 						++i;
-					}
 				}
 
-				if(cf_list) {
-					if(strchr(cf_list_chr, ln_dat[i]) && ln_dat[i + 1] == ' ') {
+				if(cf_list) 
+				{
+					if(strchr(cf_list_chr, ln_dat[i]) && ln_dat[i + 1] == ' ') 
 						i += 2;
-					}
 				}
 
-				if(i) {
+				if(i) 
+				{
 					k = i;
 					
-					strcpy(ln_dat + i, lp_arr[lp_cur]);
+					/* strcpy(ln_dat + i, lp_arr[lp_cur]); */
+					
+					if (lp_arr_i_bank[lp_cur]==0)
+						strcpy(ln_dat + i, lp_arr[lp_cur]);
+					else
+						GetString(ln_dat + i, lp_arr[lp_cur]);
 
 					ModifyLine(lp_cur, ln_dat);
 				}
 			}
-		
 #if OPT_MACRO
 		}
 #endif			
-
-		if(box_shr < box_rows - 1) {
-
+		if(box_shr < box_rows - 1) 
+		{
 			++box_shr;
-
 			Refresh(box_shr, lp_cur);
 		}
-		else {
+		else 
 			Refresh(0, lp_cur - box_rows + 1);
-		}
 
 		box_shc = k;
-
 		lp_chg = 1;
 	}
 }
 
 #if OPT_BLOCK
-
 /* Set block start
    ---------------
 */
 LoopBlkStart()
 {
-	if(blk_start != -1 || (blk_end != -1 && lp_cur > blk_end)) {
+	if(blk_start != -1 || (blk_end != -1 && lp_cur > blk_end))
 		LoopBlkUnset();
-	}
 
 	blk_start = lp_cur;
 
-	if(blk_end != -1) {
+	if(blk_end != -1)
+	{
 		RefreshBlock(box_shr, 1);
-
 		blk_count = blk_end - blk_start + 1;
 	}
 }
@@ -735,15 +715,14 @@ LoopBlkStart()
 */
 LoopBlkEnd()
 {
-	if(blk_end != -1 || (blk_start != -1 && lp_cur < blk_start) ) {
+	if(blk_end != -1 || (blk_start != -1 && lp_cur < blk_start) ) 
 		LoopBlkUnset();
-	}
 
 	blk_end = lp_cur;
 
-	if(blk_start != -1) {
-		RefreshBlock(0, 1);  // FIXME -- optimize
-
+	if(blk_start != -1) 
+	{
+		RefreshBlock(0, 1);  /* FIXME -- optimize */
 		blk_count = blk_end - blk_start + 1;
 	}
 }
@@ -753,10 +732,10 @@ LoopBlkEnd()
 */
 LoopBlkUnset()
 {
-	if(blk_count) {
-		if(blk_start <= GetLastLine() && blk_end >= GetFirstLine()) {
-			RefreshBlock(0, 0);  // FIXME -- optimize
-		}
+	if(blk_count) 
+	{
+		if(blk_start <= GetLastLine() && blk_end >= GetFirstLine())
+			RefreshBlock(0, 0);  /* FIXME -- optimize */
 	}
 
 	blk_start = blk_end = -1;
@@ -765,12 +744,12 @@ LoopBlkUnset()
 
 LoopBlkEx()
 {
-	if(!blk_count) {
+	if(!blk_count) 
+	{
 		blk_start = blk_end = lp_cur;
 		blk_count = 1;
 	}
 }
-
 #endif
 
 /* Copy line
@@ -778,21 +757,14 @@ LoopBlkEx()
 */
 LoopCopy()
 {
-
 #if OPT_BLOCK
-
 	LoopBlkEx();
 	
-	if(LoopCopyEx()) {
+	if(LoopCopyEx())
 		LoopBlkUnset();
-	}
-
 #else
-
 	strcpy(clp_line, ln_dat);
-
 #endif
-
 }
 
 #if OPT_BLOCK
@@ -803,24 +775,49 @@ LoopCopyEx()
 
 	LoopClrClp();
 
-	if((clp_arr = AllocMem(blk_count * SIZEOF_PTR))) {
-		for(i = 0; i < blk_count; ++i) {
-			if((clp_arr[i] = AllocMem(strlen(lp_arr[blk_start + i]) + 1))) {
-				strcpy(clp_arr[i], lp_arr[blk_start + i]);
-			}
-			else {
-				FreeArray(clp_arr, i, 1);
+	if (blk_count > CLP_LINES_MAX)
+	  return 0;
 
-				return 0;
-			}
+	/* if((clp_arr = (char**)AllocMem(blk_count * 2))) -- allready allocated */
+
+	for(i = 0; i < blk_count; ++i) 
+	{
+		/* if((clp_arr[i] = AllocMem(strlen(lp_arr[blk_start + i]) + 1))) */
+
+		if (lp_arr_i_bank[blk_start + i]==0)
+			tmp = strlen(lp_arr[blk_start + i]);
+		else
+			tmp = StringLen(lp_arr[blk_start + i]);
+
+		ptmp = AllocMem(tmp+1, &bank);
+
+		if (ptmp)
+		{
+			clp_arr_i_bank[i] = bank;
+			clp_arr[i] = ptmp;
+
+			/* strcpy(clp_arr[i], lp_arr[blk_start + i]); */
+
+			if (lp_arr_i_bank[blk_start + i]==0)
+				strcpy(tmpbuf, lp_arr[blk_start + i]);
+			else
+				GetString(tmpbuf, lp_arr[blk_start + i]);
+
+			if (clp_arr_i_bank[i]==0)
+				strcpy(clp_arr[i], tmpbuf);
+			else
+				PutString(tmpbuf, clp_arr[i]);
 		}
-
-		clp_count = blk_count;
-
-		return 1;
+		else 
+		{
+			FreeClipboard();
+			return 0;
+		}
 	}
+	
+	clp_count = blk_count;
 
-	return 0;
+	return 1;
 }
 
 #endif
@@ -838,12 +835,10 @@ LoopDelete()
 	
 #else
 
-	if(lp_cur != lp_now - 1) {
-			DeleteLine(lp_cur);
-	}
-	else {
+	if(lp_cur != lp_now - 1) 
+		DeleteLine(lp_cur);
+	else 
 		ClearLine(lp_cur);
-	}
 
 	Refresh(box_shr, lp_cur);
 
@@ -859,29 +854,26 @@ LoopDelete()
 
 LoopDeleteEx()
 {
-	//if(blk_count) {
-		LoopGo(blk_start);
+	LoopGo(blk_start);
 
-		while(blk_count--) {
-			if(blk_start != lp_now - 1) {
-				DeleteLine(blk_start);
-			}
-			else {
-				ClearLine(blk_start);
-			}
+	while(blk_count--) 
+	{
+		if(blk_start != lp_now - 1) 
+			DeleteLine(blk_start);
+		else 
+			ClearLine(blk_start);
 
-			--blk_end;
+		--blk_end;
 
-			Refresh(box_shr, lp_cur);
-		}
+		Refresh(box_shr, lp_cur);
+	}
 
-		blk_start = blk_end = -1;
-		blk_count = 0;
+	blk_start = blk_end = -1;
+	blk_count = 0;
 
-		box_shc = 0;
+	box_shc = 0;
 
-		lp_chg = 1;
-	//}
+	lp_chg = 1;
 }
 
 #endif
@@ -891,23 +883,16 @@ LoopDeleteEx()
 */
 LoopCut()
 {
-
 #if OPT_BLOCK
-
 	LoopBlkEx();
 	
-	if(LoopCopyEx()) {
+	if(LoopCopyEx())
 		LoopDeleteEx();
-	}
-
 #else
-
 	strcpy(clp_line, ln_dat);
 
 	LoopDelete();
-
 #endif
-
 }
 
 /* Paste line
@@ -915,30 +900,34 @@ LoopCut()
 */
 LoopPaste()
 {
-
 #if OPT_BLOCK
 
 	int i;
 
-	if(clp_count) {
-		for(i = 0; i < clp_count; ++i) {
-			if(InsertLine(lp_cur, clp_arr[i])) {
+	if(clp_count)
+	{
+		for(i = 0; i < clp_count; ++i) 
+		{
+			if (clp_arr_i_bank[i]==0)
+				strcpy(tmpbuf, clp_arr[i]);
+			else
+				GetString(tmpbuf, clp_arr[i]);
+
+			if(InsertLine(lp_cur, tmpbuf))
+			{
 				Refresh(box_shr, lp_cur);
 				LoopDown();
 			}
-			else {
+			else 
 				break;
-			}
 		}
 
 		box_shc = 0;
-
 		lp_chg = 1;
 	}
-
 #else
-
-	if((InsertLine(lp_cur, clp_line))) {
+	if((InsertLine(lp_cur, clp_line))) 
+	{
 		Refresh(box_shr, lp_cur);
 		LoopDown();
 
@@ -947,9 +936,7 @@ LoopPaste()
 		lp_chg = 1;
 
 	}
-
 #endif
-
 }
 
 /* Clear the clipboard
@@ -957,21 +944,16 @@ LoopPaste()
 */
 LoopClrClp()
 {
-
 #if OPT_BLOCK
-
-	if(clp_count) {
-		FreeArray(clp_arr, clp_count, 1);
-
+	if(clp_count) 
+	{
+		FreeClipboard();
 		clp_count = 0;
 	}
-
 #else
 
 	*clp_line = '\0';
-
 #endif
-
 }
 
 /* Delete CR on the left
@@ -982,54 +964,58 @@ LoopLeftDel()
 	char *p;
 	int ok, rs, pos;
 
-	if(ln_dat[0]) {
+	if(ln_dat[0])
+	{
 		/* Line is not empty */
-		
-		p = lp_arr[lp_cur - 1];
+
+		if (lp_arr_i_bank[lp_cur - 1]==0)
+			strcpy(tmpbuf, lp_arr[lp_cur - 1]);
+		else
+			GetString(tmpbuf, lp_arr[lp_cur - 1]);
+
+		p = tmpbuf;
 
 		if(*p) {
 			/* Previous line is not empty */
 			
 			pos = strlen(p);
 
-			if((ok = JoinLines(lp_cur - 1))) {
+			if((ok = JoinLines(lp_cur - 1))) 
 				rs = 0;
-			}
 		}
-		else {
+		else 
+		{
 			/* Previous line is empty */
-			
-			if((ok = DeleteLine(lp_cur - 1))) {
+			if((ok = DeleteLine(lp_cur - 1))) 
+			{
 				rs = 0;
 				pos = 0;
 			}
 		}
 	}
-	else {
+	else 
+	{
 		/* Line is empty */
-		
-		if((ok = DeleteLine(lp_cur))) {
+		if((ok = DeleteLine(lp_cur))) 
+		{
 			rs = 1;
 			pos = 999;
 		}
 	}
 
-	if(ok) {
-
+	if(ok) 
+	{
 		--lp_cur;
 
-		if(box_shr)	{
-
+		if(box_shr)	
+		{
 			--box_shr;
-
 			Refresh(box_shr + rs, lp_cur + rs);
 		}
-		else {
+		else 
 			Refresh(0, lp_cur);
-		}
 
 		box_shc = pos;
-
 		lp_chg = 1;
 	}
 }
@@ -1042,55 +1028,51 @@ LoopRightDel()
 	char *p;
 	int ok, rs;
 	
-	p = lp_arr[lp_cur + 1];
+	if (lp_arr_i_bank[lp_cur + 1]==0)
+		strcpy(tmpbuf, lp_arr[lp_cur + 1]);
+	else
+		GetString(tmpbuf, lp_arr[lp_cur + 1]);
 
-	if(ln_dat[0]) {
+	p = tmpbuf;
+
+	if(ln_dat[0]) 
+	{
 		/* Line is not empty */
-
-		if(*p) {
+		if(*p) 
+		{
 			/* Next line is not empty */
-			
-			if((ok = JoinLines(lp_cur))) {
+			if((ok = JoinLines(lp_cur)))
 				rs = 0;
-			}
 		}
-		else {
+		else 
+		{
 			/* Next line is empty */
-			
-			if((ok = DeleteLine(lp_cur + 1))) {
+			if((ok = DeleteLine(lp_cur + 1)))
 				rs = 1;
-			}
 		}
 	}
-	else {
+	else 
+	{
 		/* Line is empty */
-		
-		if((ok = DeleteLine(lp_cur))) {
-
-			if(*p) {
-				/* Next line is not empty */
-				
-				rs = 0;
-			}
-			else {
-				/* Next line is empty */
-				
-				rs = 1;
-			}
+		if((ok = DeleteLine(lp_cur))) 
+		{
+			if(*p)	
+				rs = 0; /* Next line is not empty */
+			else 				
+				rs = 1; /* Next line is empty */
 		}
 	}
 
-	if(ok) {
-		if(box_shr + rs < box_rows) {
+	if(ok) 
+	{
+		if(box_shr + rs < box_rows)
 			Refresh(box_shr + rs, lp_cur + rs);
-		}
 
 		lp_chg = 1;
 	}
 }
 
 #if OPT_FIND
-
 /* Find string
    -----------
 */
@@ -1105,7 +1087,14 @@ LoopFind()
 
 	for(line = lp_cur; line < lp_now; ++line)
 	{
-		for(slen = strlen((p = lp_arr[line])); flen <= (slen - col) && col < slen; ++col)
+		if (lp_arr_i_bank[line]==0)
+			strcpy(tmpbuf, lp_arr[line]);
+		else
+			GetString(tmpbuf, lp_arr[line]);
+
+		p = tmpbuf;
+
+		for(slen = strlen(p); flen <= (slen - col) && col < slen; ++col)
 		{
 			for(i = 0; i < flen && find_str[i] == p[col + i]; ++i)
 				;
@@ -1140,9 +1129,7 @@ LoopFindFirst()
 	find_str[0] = '\0';
 
 	if(SysLineStr("Find", find_str, FIND_MAX - 1))
-	{
 		LoopFind();
-	}
 }
 
 /* Find next string
@@ -1157,7 +1144,13 @@ LoopFindNext()
 		old_box_shc = box_shc;
 
 		/* Skip current character */
-		if(box_shc < strlen(lp_arr[lp_cur]))
+
+		if (lp_arr_i_bank[lp_cur]==0)
+			tmp = strlen(lp_arr[lp_cur]);
+		else
+			tmp = StringLen(lp_arr[lp_cur]);
+
+		if(box_shc < tmp)
 			++box_shc;
 
 		/* Set old cursor position on find failure */
@@ -1169,14 +1162,13 @@ LoopFindNext()
 #endif
 
 #if OPT_GOTO
-
 /* Go to line # (1..X)
    -------------------
 */
 LoopGoLine()
 {
 	char buf[6];
-	int line, first, last;
+	int line;
 
 	buf[0] = '\0';
 
@@ -1185,22 +1177,7 @@ LoopGoLine()
 		line = atoi(buf);
 
 		if(line > 0 && line <= lp_now)
-		{
-			/*
-			first = GetFirstLine();
-			last = GetLastLine();
-
-			lp_cur = line - 1;
-			box_shc = 0;
-
-			if(lp_cur >= first && lp_cur <= last)
-				box_shr = lp_cur - first;
-			else
-				Refresh((box_shr = 0), lp_cur);
-			*/
-
 			LoopGo(line - 1);
-		}
 	}
 }
 
@@ -1245,9 +1222,7 @@ LoopMacro()
 		if(len_type)
 		{
 			if(strlen(fn) + len_type < FILENAME_MAX)
-			{
 				strcat(fn, MAC_FTYPE);
-			}
 		}
 	
 		MacroRunFile(fn);
@@ -1255,5 +1230,3 @@ LoopMacro()
 }
 
 #endif
-
-
