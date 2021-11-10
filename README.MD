@@ -1,6 +1,12 @@
 te
 ==
 
+***TE for the RC2014 computer with the 128KB module***
+
+***This file is a WIP, some sections don't apply as they are.***
+
+***Please read the file `readme.txt` for more information.***
+
 v1.71 / 25 Sep 2021 for CP/M
 
 (c) 2015-2021 Miguel Garcia / FloppySoftware
